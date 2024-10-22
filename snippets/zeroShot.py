@@ -7,7 +7,7 @@ import os
 
 def loadModel():
 
-	TOKEN="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"
+	TOKEN=""
 	model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
 	#model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
