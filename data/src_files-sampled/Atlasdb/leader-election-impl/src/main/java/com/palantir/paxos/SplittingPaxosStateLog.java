@@ -1,0 +1,145 @@
+package com.palantir.paxos;
+
+import com.palantir.common.persist.Persistable;
+import com.palantir.logsafe.Preconditions;
+import com.palantir.logsafe.exceptions.SafeIllegalStateException;
+import com.palantir.logsafe.logger.SafeLogger;
+import com.palantir.logsafe.logger.SafeLoggerFactory;
+import java.io.IOException;
+import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicLong;
+import org.immutables.value.Value;
+
+public final class SplittingPaxosStateLog<V extends Persistable & Versionable> implements PaxosStateLog<V> {
+    private static final SafeLogger log = SafeLoggerFactory.get(SplittingPaxosStateLog.class);
+
+    private final PaxosStateLog<V> legacyLog;
+    private final PaxosStateLog<V> currentLog;
+    private final Runnable markLegacyWrite;
+    private final Runnable markLegacyRead;
+    private final long cutoffInclusive;
+    private final AtomicLong legacyLogLeastLogEntry;
+
+    private SplittingPaxosStateLog(
+            PaxosStateLog<V> legacyLog,
+            PaxosStateLog<V> currentLog,
+            Runnable markLegacyWrite,
+            Runnable markLegacyRead,
+            long cutoffInclusive,
+            AtomicLong legacyLogLeastLogEntry) {
+        this.legacyLog = legacyLog;
+        this.currentLog = currentLog;
+        this.markLegacyWrite = markLegacyWrite;
+        this.markLegacyRead = markLegacyRead;
+        this.cutoffInclusive = cutoffInclusive;
+        this.legacyLogLeastLogEntry = legacyLogLeastLogEntry;
+    }
+
+    public static <V extends Persistable & Versionable> PaxosStateLog<V> create(SplittingParameters<V> parameters) {
+        Preconditions.checkState(
+                parameters.cutoffInclusive() == PaxosAcceptor.NO_LOG_ENTRY
+                        || parameters.currentLog().getGreatestLogEntry() >= parameters.cutoffInclusive(),
+                "Cutoff value must either be -1, or the current log must contain an entry after the cutoff.");
+        return new SplittingPaxosStateLog<>(
+                parameters.legacyLog(),
+                parameters.currentLog(),
+                parameters.legacyOperationMarkers().markLegacyWrite(),
+                parameters.legacyOperationMarkers().markLegacyRead(),
+                parameters.cutoffInclusive(),
+                new AtomicLong(parameters.legacyLog().getLeastLogEntry()));
+    }
+
+    public static <V extends Persistable & Versionable> PaxosStateLog<V> createWithMigration(
+            PaxosStorageParameters params,
+            Persistable.Hydrator<V> hydrator,
+            LegacyOperationMarkers legacyOperationMarkers,
+            OptionalLong migrateFrom) {
+        String logDirectory = params.fileBasedLogDirectory()
+                .orElseThrow(() -> new SafeIllegalStateException("We currently need to have file-based storage"));
+        NamespaceAndUseCase namespaceUseCase = params.namespaceAndUseCase();
+
+        PaxosStateLogMigrator.MigrationContext<V> migrationContext = ImmutableMigrationContext.<V>builder()
+                .sourceLog(PaxosStateLogImpl.createFileBacked(logDirectory))
+                .destinationLog(SqlitePaxosStateLog.create(namespaceUseCase, params.sqliteDataSource()))
+                .hydrator(hydrator)
+                .migrationState(SqlitePaxosStateLogMigrationState.create(namespaceUseCase, params.sqliteDataSource()))
+                .migrateFrom(migrateFrom)
+                .namespaceAndUseCase(namespaceUseCase)
+                .skipValidationAndTruncateSourceIfMigrated(params.skipConsistencyCheckAndTruncateOldPaxosLog())
+                .build();
+
+        long cutoff = PaxosStateLogMigrator.migrateAndReturnCutoff(migrationContext);
+
+        if (params.skipConsistencyCheckAndTruncateOldPaxosLog()) {
+            return migrationContext.destinationLog();
+        }
+
+        SplittingParameters<V> splittingParameters = ImmutableSplittingParameters.<V>builder()
+                .legacyLog(migrationContext.sourceLog())
+                .currentLog(migrationContext.destinationLog())
+                .cutoffInclusive(cutoff)
+                .legacyOperationMarkers(legacyOperationMarkers)
+                .build();
+
+        return SplittingPaxosStateLog.create(splittingParameters);
+    }
+
+    @Override
+    public void writeRound(long seq, V round) {
+        if (seq >= cutoffInclusive) {
+            currentLog.writeRound(seq, round);
+        } else {
+            markLegacyWrite.run();
+            legacyLog.writeRound(seq, round);
+            legacyLogLeastLogEntry.accumulateAndGet(seq, Math::min);
+        }
+    }
+
+    @Override
+    public byte[] readRound(long seq) throws IOException {
+        if (seq >= cutoffInclusive) {
+            return currentLog.readRound(seq);
+        } else {
+            markLegacyRead.run();
+            return legacyLog.readRound(seq);
+        }
+    }
+
+    @Override
+    public long getLeastLogEntry() {
+        return Math.min(legacyLogLeastLogEntry.get(), cutoffInclusive);
+    }
+
+    @Override
+    public long getGreatestLogEntry() {
+        return currentLog.getGreatestLogEntry();
+    }
+
+    @Override
+    public void truncate(long toDeleteInclusive) {
+        log.warn("Tried to truncate paxos state log with an implementation that does not support truncations.");
+    }
+
+    @Override
+    public void truncateAllRounds() {
+        log.warn("Tried to truncate paxos state log with an implementation that does not support truncations.");
+    }
+
+    @Value.Immutable
+    interface SplittingParameters<V extends Persistable & Versionable> {
+        PaxosStateLog<V> legacyLog();
+
+        PaxosStateLog<V> currentLog();
+
+        LegacyOperationMarkers legacyOperationMarkers();
+
+        long cutoffInclusive();
+    }
+
+    @Value.Immutable
+    public interface LegacyOperationMarkers {
+        Runnable markLegacyWrite();
+
+        Runnable markLegacyRead();
+    }
+}

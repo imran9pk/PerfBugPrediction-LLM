@@ -1,0 +1,202 @@
+package io.crate.execution.dml;
+
+import com.google.common.base.Throwables;
+import io.crate.common.CheckedSupplier;
+import io.crate.common.annotations.VisibleForTesting;
+import io.crate.exceptions.JobKilledException;
+import io.crate.execution.ddl.SchemaUpdateClient;
+import io.crate.execution.jobs.kill.KillAllListener;
+import io.crate.execution.jobs.kill.KillableCallable;
+import io.crate.metadata.ColumnIdent;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.bulk.MappingUpdatePerformer;
+import org.elasticsearch.action.support.replication.ReplicationOperation;
+import org.elasticsearch.action.support.replication.TransportWriteAction;
+import org.elasticsearch.cluster.action.shard.ShardStateAction;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.Writeable;
+import org.elasticsearch.index.engine.Engine;
+import org.elasticsearch.index.mapper.Mapper;
+import org.elasticsearch.index.shard.IndexShard;
+import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.indices.IndicesService;
+import org.elasticsearch.tasks.TaskId;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportService;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.Iterator;
+import java.util.Map.Entry;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+
+public abstract class TransportShardAction<Request extends ShardRequest<Request, Item>, Item extends ShardRequest.Item>
+        extends TransportWriteAction<Request, Request, ShardResponse>
+        implements KillAllListener {
+
+    private final ConcurrentHashMap<TaskId, KillableCallable<?>> activeOperations = new ConcurrentHashMap<>();
+    private final MappingUpdatePerformer mappingUpdate;
+
+    protected TransportShardAction(String actionName,
+                                   TransportService transportService,
+                                   ClusterService clusterService,
+                                   IndicesService indicesService,
+                                   ThreadPool threadPool,
+                                   ShardStateAction shardStateAction,
+                                   Writeable.Reader<Request> reader,
+                                   SchemaUpdateClient schemaUpdateClient) {
+        super(
+            actionName,
+            transportService,
+            clusterService,
+            indicesService,
+            threadPool,
+            shardStateAction,
+            reader,
+            reader,
+            ThreadPool.Names.WRITE,
+            false
+        );
+        this.mappingUpdate = (update, shardId) -> {
+            validateMapping(update.root().iterator(), false);
+            schemaUpdateClient.blockingUpdateOnMaster(shardId.getIndex(), update);
+        };
+    }
+
+    @Override
+    protected ShardResponse newResponseInstance(StreamInput in) throws IOException {
+        return new ShardResponse(in);
+    }
+
+    @Override
+    protected void shardOperationOnPrimary(Request request,
+                                           IndexShard primary,
+                                           ActionListener<PrimaryResult<Request, ShardResponse>> listener) {
+        ActionListener.completeWith(
+            listener,
+            () -> {
+                KillableWrapper<WritePrimaryResult<Request, ShardResponse>> callable =
+                    new KillableWrapper<WritePrimaryResult<Request, ShardResponse>>(request.jobId()) {
+                        @Override
+                        public WritePrimaryResult<Request, ShardResponse> call() throws Exception {
+                            return processRequestItems(primary, request, killed);
+                        }
+                    };
+                return wrapOperationInKillable(request, callable);
+            }
+        );
+    }
+
+    @Override
+    protected WriteReplicaResult<Request> shardOperationOnReplica(Request replicaRequest, IndexShard indexShard) {
+        KillableWrapper<WriteReplicaResult<Request>> callable =
+            new KillableWrapper<WriteReplicaResult<Request>>(replicaRequest.jobId()) {
+                @Override
+                public WriteReplicaResult<Request> call() throws Exception {
+                    return processRequestItemsOnReplica(indexShard, replicaRequest);
+                }
+            };
+        return wrapOperationInKillable(replicaRequest, callable);
+    }
+
+    private <WrapperResponse> WrapperResponse wrapOperationInKillable(Request request, KillableCallable<WrapperResponse> callable) {
+        TaskId id = request.getParentTask();
+        activeOperations.put(id, callable);
+        WrapperResponse response;
+        try {
+            response = callable.call();
+        } catch (Throwable e) {
+            throw Throwables.propagate(e);
+        } finally {
+            activeOperations.remove(id, callable);
+        }
+        return response;
+
+    }
+
+    @Override
+    public void killAllJobs() {
+        synchronized (activeOperations) {
+            for (KillableCallable<?> callable : activeOperations.values()) {
+                callable.kill(new InterruptedException(JobKilledException.MESSAGE));
+            }
+            activeOperations.clear();
+        }
+    }
+
+    @Override
+    public void killJob(UUID jobId) {
+        synchronized (activeOperations) {
+            Iterator<Entry<TaskId, KillableCallable<?>>> iterator = activeOperations.entrySet().iterator();
+            while (iterator.hasNext()) {
+                var entry = iterator.next();
+                KillableCallable<?> killable = entry.getValue();
+                if (killable.jobId().equals(jobId)) {
+                    iterator.remove();
+                    killable.kill(new InterruptedException(JobKilledException.MESSAGE));
+                }
+            }
+        }
+    }
+
+    protected abstract WritePrimaryResult<Request, ShardResponse> processRequestItems(IndexShard indexShard, Request request, AtomicBoolean killed) throws InterruptedException, IOException;
+
+    protected abstract WriteReplicaResult<Request> processRequestItemsOnReplica(IndexShard indexShard, Request replicaRequest) throws IOException;
+
+    abstract static class KillableWrapper<WrapperResponse> implements KillableCallable<WrapperResponse> {
+
+        protected final AtomicBoolean killed = new AtomicBoolean(false);
+        final UUID jobId;
+
+        KillableWrapper(UUID jobId) {
+            this.jobId = jobId;
+        }
+
+        public UUID jobId() {
+            return jobId;
+        }
+
+        @Override
+        public void kill(@Nullable Throwable t) {
+            killed.getAndSet(true);
+        }
+    }
+
+    protected <T extends Engine.Result> T executeOnPrimaryHandlingMappingUpdate(ShardId shardId,
+                                                                                CheckedSupplier<T, IOException> execute,
+                                                                                Function<Exception, T> onMappingUpdateError) throws IOException {
+        T result = execute.get();
+        if (result.getResultType() == Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
+            try {
+                mappingUpdate.updateMappings(result.getRequiredMappingUpdate(), shardId);
+            } catch (Exception e) {
+                return onMappingUpdateError.apply(e);
+            }
+            result = execute.get();
+            if (result.getResultType() == Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
+                throw new ReplicationOperation.RetryOnPrimaryException(shardId,
+                    "Dynamic mappings are not available on the node that holds the primary yet");
+            }
+        }
+        assert result.getFailure() instanceof ReplicationOperation.RetryOnPrimaryException == false :
+            "IndexShard shouldn't use RetryOnPrimaryException. got " + result.getFailure();
+        return result;
+    }
+
+    @VisibleForTesting
+    public static void validateMapping(Iterator<Mapper> mappers, boolean nested) {
+        while (mappers.hasNext()) {
+            Mapper mapper = mappers.next();
+            if (nested) {
+                ColumnIdent.validateObjectKey(mapper.simpleName());
+            } else {
+                ColumnIdent.validateColumnName(mapper.simpleName());
+            }
+            validateMapping(mapper.iterator(), true);
+        }
+    }
+}
